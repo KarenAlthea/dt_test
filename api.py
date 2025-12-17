@@ -84,4 +84,104 @@ def compute_kpi(payload: InstancePayload):
 def root():
     return {"status": "ok", "service": "DTaaS", "docs": "/docs"}
 
+from fastapi.responses import HTMLResponse
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    # JSON di esempio pre-caricato nella textarea
+    sample = r'''{
+  "instance": {
+    "line": {
+      "line_name": "Assembly_Cell_A",
+      "shift_hours": 8,
+      "target_throughput_pph": 180
+    },
+    "station": {
+      "id": "S1",
+      "type": "assembly",
+      "cycle_time_s": 20,
+      "availability_pct": 92,
+      "setup_time_s": 5,
+      "scrap_rate_pct": 1.5
+    },
+    "quality": {
+      "inspection_enabled": true,
+      "rework_enabled": false,
+      "rework_cycle_time_s": 60
+    },
+    "data": {
+      "mode": "simulation"
+    }
+  }
+}'''
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>DTaaS – Simple UI</title>
+  <style>
+    body {{ font-family: system-ui, Arial; max-width: 980px; margin: 40px auto; padding: 0 16px; }}
+    textarea {{ width: 100%; height: 260px; font-family: ui-monospace, Menlo, Consolas, monospace; }}
+    button {{ padding: 10px 14px; cursor: pointer; }}
+    pre {{ background: #f6f6f6; padding: 12px; overflow: auto; }}
+    .row {{ display:flex; gap: 12px; align-items:center; flex-wrap: wrap; }}
+  </style>
+</head>
+<body>
+  <h2>DTaaS – Simple UI</h2>
+  <p>Incolla (o modifica) la <b>instance</b> e premi <b>Compute KPI</b>.</p>
+
+  <textarea id="payload">{sample}</textarea>
+
+  <div class="row" style="margin-top:12px;">
+    <button onclick="compute()">Compute KPI</button>
+    <span id="status"></span>
+  </div>
+
+  <h3>Output</h3>
+  <pre id="out">—</pre>
+
+  <script>
+    async function compute() {{
+      const status = document.getElementById("status");
+      const out = document.getElementById("out");
+      status.textContent = "Running...";
+      out.textContent = "—";
+
+      let payload;
+      try {{
+        payload = JSON.parse(document.getElementById("payload").value);
+      }} catch (e) {{
+        status.textContent = "JSON non valido";
+        out.textContent = String(e);
+        return;
+      }}
+
+      try {{
+        const res = await fetch("/compute-kpi", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(payload)
+        }});
+
+        const data = await res.json();
+        status.textContent = res.ok ? "OK" : ("Error " + res.status);
+        out.textContent = JSON.stringify(data, null, 2);
+      }} catch (e) {{
+        status.textContent = "Request failed";
+        out.textContent = String(e);
+      }}
+    }}
+  </script>
+
+  <p style="margin-top:20px;">
+    Docs API: <a href="/docs">/docs</a>
+  </p>
+</body>
+</html>
+"""
+
 
