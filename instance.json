@@ -1,0 +1,13 @@
+{
+  "line": { "line_name": "Cell_1", "shift_hours": 8, "target_throughput_pph": 200 },
+  "station": {
+    "id": "S1",
+    "type": "assembly",
+    "cycle_time_s": 18,
+    "availability_pct": 95,
+    "setup_time_s": 5,
+    "scrap_rate_pct": 0.8
+  },
+  "quality": { "inspection_enabled": true, "rework_enabled": false, "rework_cycle_time_s": 60 },
+  "data": { "mode": "simulation" }
+}

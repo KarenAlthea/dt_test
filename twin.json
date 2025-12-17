@@ -1,0 +1,43 @@
+{
+  "twin_id": "Cell_1",
+  "type": "single_station_cell",
+  "nodes": [
+    {
+      "id": "SRC",
+      "kind": "source"
+    },
+    {
+      "id": "S1",
+      "kind": "station",
+      "station_type": "assembly",
+      "params": {
+        "cycle_time_s": 18,
+        "availability_pct": 95,
+        "setup_time_s": 5,
+        "scrap_rate_pct": 0.8
+      }
+    },
+    {
+      "id": "SNK",
+      "kind": "sink"
+    }
+  ],
+  "edges": [
+    {
+      "from": "SRC",
+      "to": "S1"
+    },
+    {
+      "from": "S1",
+      "to": "SNK"
+    }
+  ],
+  "quality": {
+    "inspection_enabled": true,
+    "rework_enabled": false,
+    "rework_cycle_time_s": 60
+  },
+  "data": {
+    "mode": "simulation"
+  }
+}
