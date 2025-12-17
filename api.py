@@ -80,4 +80,8 @@ def compute_kpi(payload: InstancePayload):
     kpis = compute_kpis(twin)
     return {"twin_id": twin["twin_id"], "kpis": kpis, "twin": twin}
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "DTaaS", "docs": "/docs"}
+
 
