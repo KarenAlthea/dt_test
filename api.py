@@ -33,6 +33,9 @@ COMPONENTS = {
     }
 }
 
+@app.get("/components")
+def list_components():
+    return [{"id": k, "name": v["name"]} for k, v in COMPONENTS.items()]
 
 # ---- Helpers (uguali a quello che hai già fatto) ----
 
@@ -554,6 +557,7 @@ def ui_template():
 </body>
 </html>
 """
+
 
 
 
