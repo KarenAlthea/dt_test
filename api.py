@@ -37,6 +37,200 @@ COMPONENTS = {
 def list_components():
     return [{"id": k, "name": v["name"]} for k, v in COMPONENTS.items()]
 
+def build_template_schema(case: dict) -> dict:
+    """
+    case esempio:
+    {
+      "line_type": "flow_line",
+      "num_stations": 3,
+      "buffer_between": true
+    }
+    """
+    num_stations = int(case.get("num_stations", 1))
+    buffer_between = bool(case.get("buffer_between", True))
+
+    # base schema
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["line", "stations", "buffers", "sim"],
+        "properties": {
+            "line": {
+                "type": "object",
+                "required": ["line_name"],
+                "properties": {
+                    "line_name": {"type": "string", "minLength": 2, "title": "Line name"}
+                }
+            },
+            "stations": {
+                "type": "array",
+                "minItems": num_stations,
+                "maxItems": num_stations,
+                "items": {
+                    "type": "object",
+                    "required": ["id", "type", "cycle_time_s", "availability_pct"],
+                    "properties": {
+                        "id": {"type": "string", "title": "Station ID"},
+                        **COMPONENTS["station"]["params"]
+                    }
+                }
+            },
+            "buffers": {
+                "type": "array",
+                "minItems": (num_stations - 1) if buffer_between and num_stations > 1 else 0,
+                "maxItems": (num_stations - 1) if buffer_between and num_stations > 1 else 0,
+                "items": {
+                    "type": "object",
+                    "required": ["id", "capacity"],
+                    "properties": {
+                        "id": {"type": "string", "title": "Buffer ID"},
+                        **COMPONENTS["buffer"]["params"]
+                    }
+                }
+            },
+            "sim": {
+                "type": "object",
+                "required": ["horizon_s", "interarrival_s"],
+                "properties": {
+                    "horizon_s": {"type": "number", "minimum": 10, "default": 3600, "title": "Simulation horizon (s)"},
+                    "interarrival_s": COMPONENTS["source"]["params"]["interarrival_s"]
+                }
+            }
+        }
+    }
+
+    return schema
+from pydantic import BaseModel
+from typing import Any, Dict
+
+class CasePayload(BaseModel):
+    case: Dict[str, Any]
+
+@app.post("/template-builder/schema")
+def template_builder_schema(payload: CasePayload):
+    schema = build_template_schema(payload.case)
+    return schema
+@app.get("/ui-builder", response_class=HTMLResponse)
+def ui_builder():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>DTaaS – Template Builder UI</title>
+  <style>
+    body { font-family: system-ui, Arial; max-width: 980px; margin: 40px auto; padding: 0 16px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    button { padding: 10px 14px; cursor: pointer; }
+    pre { background:#f6f6f6; padding:12px; overflow:auto; }
+    #editor_holder { margin-top: 16px; }
+    label { font-weight: 600; }
+    input, select { padding: 6px; }
+  </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@json-editor/json-editor@latest/dist/css/jsoneditor.min.css">
+</head>
+<body>
+  <h2>DTaaS – Template Builder</h2>
+  <p>Scegli il caso d’uso → la piattaforma genera il template → compili il form → simulazione.</p>
+
+  <div class="row">
+    <label>Num stations</label>
+    <input id="num_stations" type="number" min="1" max="10" value="3" />
+    <label>Buffers</label>
+    <select id="buffers">
+      <option value="true" selected>Yes</option>
+      <option value="false">No</option>
+    </select>
+    <button onclick="build()">Generate Form</button>
+    <button onclick="simulate()">Run SimPy Simulation</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="editor_holder"></div>
+
+  <h3>Output</h3>
+  <pre id="out">—</pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/@json-editor/json-editor@latest/dist/jsoneditor.min.js"></script>
+  <script>
+    let editor = null;
+
+    async function build() {
+      const status = document.getElementById('status');
+      status.textContent = 'Generating...';
+
+      const num_stations = parseInt(document.getElementById('num_stations').value || '1');
+      const buffer_between = (document.getElementById('buffers').value === 'true');
+
+      const res = await fetch('/template-builder/schema', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ case: { line_type: "flow_line", num_stations, buffer_between } })
+      });
+      const schema = await res.json();
+
+      if (editor) { editor.destroy(); editor = null; }
+
+      editor = new JSONEditor(document.getElementById('editor_holder'), {
+        schema: schema,
+        disable_collapse: true,
+        disable_properties: true,
+        no_additional_properties: true,
+        required_by_default: true
+      });
+
+      // valori iniziali comodi
+      const initStations = Array.from({length:num_stations}).map((_,i)=>({
+        id: `S${i+1}`, type: (i%2===0?'assembly':'welding'),
+        cycle_time_s: 20, availability_pct: 92, scrap_rate_pct: 1.0
+      }));
+      const initBuffers = buffer_between ? Array.from({length:Math.max(0,num_stations-1)}).map((_,i)=>({
+        id: `B${i+1}${i+2}`, capacity: 10
+      })) : [];
+
+      editor.setValue({
+        line: { line_name: "Line_A" },
+        stations: initStations,
+        buffers: initBuffers,
+        sim: { horizon_s: 3600, interarrival_s: 5 }
+      });
+
+      status.textContent = 'Ready';
+      document.getElementById('out').textContent = '—';
+    }
+
+    async function simulate() {
+      const status = document.getElementById('status');
+      const out = document.getElementById('out');
+      out.textContent = '—';
+
+      if (!editor) { status.textContent = 'Generate form first'; return; }
+
+      const errors = editor.validate();
+      if (errors.length) { status.textContent = 'Fix validation errors'; out.textContent = JSON.stringify(errors,null,2); return; }
+
+      status.textContent = 'Running simulation...';
+      const instance = editor.getValue();
+
+      const res = await fetch('/simulate', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ instance })
+      });
+      const data = await res.json();
+
+      status.textContent = res.ok ? 'OK' : ('Error ' + res.status);
+      out.textContent = JSON.stringify(data, null, 2);
+    }
+
+    build();
+  </script>
+</body>
+</html>
+"""
+
+
 # ---- Helpers (uguali a quello che hai già fatto) ----
 
 def compile_twin(instance: Dict[str, Any]) -> Dict[str, Any]:
@@ -557,6 +751,7 @@ def ui_template():
 </body>
 </html>
 """
+
 
 
 
