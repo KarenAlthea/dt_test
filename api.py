@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Any, Dict
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 
 app = FastAPI(title="Digital Twin as a Service", version="0.1")
@@ -505,7 +505,13 @@ def ui():
 </body>
 </html>
 """
+    
+from fastapi.responses import RedirectResponse
 
+@app.get("/")
+def root():
+    return RedirectResponse("/ui-builder")
+    
 TEMPLATES = {
     "single_station_v1": {
         "template_id": "single_station_v1",
@@ -847,6 +853,7 @@ def ui_template():
 </body>
 </html>
 """
+
 
 
 
