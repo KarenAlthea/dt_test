@@ -230,6 +230,100 @@ def ui_builder():
 </html>
 """
 
+import simpy
+import random
+from pydantic import BaseModel
+
+class InstancePayload2(BaseModel):
+    instance: Dict[str, Any]
+
+def sim_flow_line(instance: Dict[str, Any]) -> Dict[str, Any]:
+    horizon_s = float(instance["sim"]["horizon_s"])
+    interarrival_s = float(instance["sim"]["interarrival_s"])
+
+    stations = instance["stations"]
+    buffers = instance.get("buffers", [])
+
+    # resources
+    env = simpy.Environment()
+
+    # station resources (1 server each)
+    res = {s["id"]: simpy.Resource(env, capacity=1) for s in stations}
+
+    # buffers as Store with capacity (if any)
+    # We'll model buffers between stations with Store. If capacity=0 => no buffer (direct handoff)
+    stores = []
+    for b in buffers:
+        cap = int(b["capacity"])
+        stores.append(simpy.Store(env, capacity=cap if cap > 0 else 1))
+
+    completed = 0
+    started = 0
+
+    def process_station(s, job_id):
+        # availability as downtime probability per job (very simple)
+        avail = float(s["availability_pct"]) / 100.0
+        ct = float(s["cycle_time_s"])
+        scrap = float(s.get("scrap_rate_pct", 0.0)) / 100.0
+
+        # request machine
+        with res[s["id"]].request() as req:
+            yield req
+
+            # downtime handling (simple): if not available, wait extra
+            if random.random() > avail:
+                yield env.timeout(ct)  # extra delay as proxy
+            yield env.timeout(ct)
+
+        # scrap handling
+        good = (random.random() > scrap)
+        return good
+
+    def job(job_id):
+        nonlocal completed
+        nonlocal started
+        started += 1
+
+        # through stations
+        for i, s in enumerate(stations):
+            good = yield env.process(process_station(s, job_id))
+
+            # if scrapped, stop job
+            if not good:
+                return
+
+            # buffer between i and i+1
+            if i < len(stations) - 1 and len(stores) > 0:
+                # put then get (represents WIP occupying buffer)
+                yield stores[i].put(job_id)
+                _ = yield stores[i].get()
+
+        completed += 1
+
+    def source():
+        job_id = 0
+        while env.now < horizon_s:
+            job_id += 1
+            env.process(job(job_id))
+            yield env.timeout(interarrival_s)
+
+    env.process(source())
+    env.run(until=horizon_s)
+
+    throughput_pph = (completed / horizon_s) * 3600.0
+
+    return {
+        "horizon_s": horizon_s,
+        "started_jobs": started,
+        "completed_good": completed,
+        "throughput_pph": round(throughput_pph, 2)
+    }
+
+@app.post("/simulate")
+def simulate(payload: InstancePayload2):
+    # semplice simulazione evento-discreto
+    result = sim_flow_line(payload.instance)
+    return {"result": result}
 
 # ---- Helpers (uguali a quello che hai già fatto) ----
 
@@ -751,6 +845,7 @@ def ui_template():
 </body>
 </html>
 """
+
 
 
 
