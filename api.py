@@ -1,18 +1,28 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Any, Dict
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
+from typing import Any, Dict, List
+import simpy
+import random
 
 
 app = FastAPI(title="Digital Twin as a Service", version="0.1")
 
-# --- Component library (minimal) ---
+
+# ============================================================
+# 1) Component library (minimal)
+# ============================================================
 COMPONENTS = {
     "source": {
         "name": "Source",
         "params": {
-            "interarrival_s": {"type": "number", "minimum": 0.1, "default": 5, "title": "Interarrival time (s)"}
-        }
+            "interarrival_s": {
+                "type": "number",
+                "minimum": 0.1,
+                "default": 5,
+                "title": "Interarrival time (s)",
+            }
+        },
     },
     "station": {
         "name": "Station",
@@ -20,24 +30,30 @@ COMPONENTS = {
             "type": {"type": "string", "enum": ["assembly", "welding"], "title": "Station type"},
             "cycle_time_s": {"type": "number", "minimum": 1, "maximum": 600, "title": "Cycle time (s)"},
             "availability_pct": {"type": "number", "minimum": 50, "maximum": 99.9, "title": "Availability (%)"},
-            "scrap_rate_pct": {"type": "number", "minimum": 0, "maximum": 20, "default": 0.0, "title": "Scrap (%)"}
-        }
+            "scrap_rate_pct": {"type": "number", "minimum": 0, "maximum": 20, "default": 0.0, "title": "Scrap (%)"},
+        },
     },
     "buffer": {
         "name": "Buffer",
         "params": {
             "capacity": {"type": "integer", "minimum": 0, "maximum": 500, "default": 10, "title": "Capacity (pcs)"}
-        }
+        },
     },
-    "sink": {
-        "name": "Sink",
-        "params": {}
-    }
+    "sink": {"name": "Sink", "params": {}},
 }
+
 
 @app.get("/components")
 def list_components():
     return [{"id": k, "name": v["name"]} for k, v in COMPONENTS.items()]
+
+
+# ============================================================
+# 2) Template Builder (dynamic schema from "case")
+# ============================================================
+class CasePayload(BaseModel):
+    case: Dict[str, Any]
+
 
 def build_template_schema(case: dict) -> dict:
     """
@@ -51,7 +67,6 @@ def build_template_schema(case: dict) -> dict:
     num_stations = int(case.get("num_stations", 1))
     buffer_between = bool(case.get("buffer_between", True))
 
-    # base schema
     schema = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -62,7 +77,7 @@ def build_template_schema(case: dict) -> dict:
                 "required": ["line_name"],
                 "properties": {
                     "line_name": {"type": "string", "minLength": 2, "title": "Line name"}
-                }
+                },
             },
             "stations": {
                 "type": "array",
@@ -73,9 +88,9 @@ def build_template_schema(case: dict) -> dict:
                     "required": ["id", "type", "cycle_time_s", "availability_pct"],
                     "properties": {
                         "id": {"type": "string", "title": "Station ID"},
-                        **COMPONENTS["station"]["params"]
-                    }
-                }
+                        **COMPONENTS["station"]["params"],
+                    },
+                },
             },
             "buffers": {
                 "type": "array",
@@ -86,32 +101,28 @@ def build_template_schema(case: dict) -> dict:
                     "required": ["id", "capacity"],
                     "properties": {
                         "id": {"type": "string", "title": "Buffer ID"},
-                        **COMPONENTS["buffer"]["params"]
-                    }
-                }
+                        **COMPONENTS["buffer"]["params"],
+                    },
+                },
             },
             "sim": {
                 "type": "object",
                 "required": ["horizon_s", "interarrival_s"],
                 "properties": {
                     "horizon_s": {"type": "number", "minimum": 10, "default": 3600, "title": "Simulation horizon (s)"},
-                    "interarrival_s": COMPONENTS["source"]["params"]["interarrival_s"]
-                }
-            }
-        }
+                    "interarrival_s": COMPONENTS["source"]["params"]["interarrival_s"],
+                },
+            },
+        },
     }
-
     return schema
-from pydantic import BaseModel
-from typing import Any, Dict
 
-class CasePayload(BaseModel):
-    case: Dict[str, Any]
 
 @app.post("/template-builder/schema")
 def template_builder_schema(payload: CasePayload):
-    schema = build_template_schema(payload.case)
-    return schema
+    return build_template_schema(payload.case)
+
+
 @app.get("/ui-builder", response_class=HTMLResponse)
 def ui_builder():
     return """
@@ -182,7 +193,6 @@ def ui_builder():
         required_by_default: true
       });
 
-      // valori iniziali comodi
       const initStations = Array.from({length:num_stations}).map((_,i)=>({
         id: `S${i+1}`, type: (i%2===0?'assembly':'welding'),
         cycle_time_s: 20, availability_pct: 92, scrap_rate_pct: 1.0
@@ -232,12 +242,13 @@ def ui_builder():
 </html>
 """
 
-import simpy
-import random
-from pydantic import BaseModel
 
+# ============================================================
+# 3) SimPy flow line simulation (multi-station)
+# ============================================================
 class InstancePayload2(BaseModel):
     instance: Dict[str, Any]
+
 
 def sim_flow_line(instance: Dict[str, Any]) -> Dict[str, Any]:
     horizon_s = float(instance["sim"]["horizon_s"])
@@ -246,15 +257,10 @@ def sim_flow_line(instance: Dict[str, Any]) -> Dict[str, Any]:
     stations = instance["stations"]
     buffers = instance.get("buffers", [])
 
-    # resources
     env = simpy.Environment()
-
-    # station resources (1 server each)
     res = {s["id"]: simpy.Resource(env, capacity=1) for s in stations}
 
-    # buffers as Store with capacity (if any)
-    # We'll model buffers between stations with Store. If capacity=0 => no buffer (direct handoff)
-    stores = []
+    stores: List[simpy.Store] = []
     for b in buffers:
         cap = int(b["capacity"])
         stores.append(simpy.Store(env, capacity=cap if cap > 0 else 1))
@@ -263,40 +269,29 @@ def sim_flow_line(instance: Dict[str, Any]) -> Dict[str, Any]:
     started = 0
 
     def process_station(s, job_id):
-        # availability as downtime probability per job (very simple)
         avail = float(s["availability_pct"]) / 100.0
         ct = float(s["cycle_time_s"])
         scrap = float(s.get("scrap_rate_pct", 0.0)) / 100.0
 
-        # request machine
         with res[s["id"]].request() as req:
             yield req
-
-            # downtime handling (simple): if not available, wait extra
             if random.random() > avail:
-                yield env.timeout(ct)  # extra delay as proxy
+                yield env.timeout(ct)  # extra delay
             yield env.timeout(ct)
 
-        # scrap handling
         good = (random.random() > scrap)
         return good
 
     def job(job_id):
-        nonlocal completed
-        nonlocal started
+        nonlocal completed, started
         started += 1
 
-        # through stations
         for i, s in enumerate(stations):
             good = yield env.process(process_station(s, job_id))
-
-            # if scrapped, stop job
             if not good:
                 return
 
-            # buffer between i and i+1
             if i < len(stations) - 1 and len(stores) > 0:
-                # put then get (represents WIP occupying buffer)
                 yield stores[i].put(job_id)
                 _ = yield stores[i].get()
 
@@ -318,20 +313,24 @@ def sim_flow_line(instance: Dict[str, Any]) -> Dict[str, Any]:
         "horizon_s": horizon_s,
         "started_jobs": started,
         "completed_good": completed,
-        "throughput_pph": round(throughput_pph, 2)
+        "throughput_pph": round(throughput_pph, 2),
     }
+
 
 @app.post("/simulate")
 def simulate(payload: InstancePayload2):
-    # semplice simulazione evento-discreto
-    result = sim_flow_line(payload.instance)
-    return {"result": result}
+    return {"result": sim_flow_line(payload.instance)}
 
-# ---- Helpers (uguali a quello che hai già fatto) ----
+
+# ============================================================
+# 4) Single-station "digital twin" compile + KPI
+# ============================================================
+class InstancePayload(BaseModel):
+    instance: Dict[str, Any]
+
 
 def compile_twin(instance: Dict[str, Any]) -> Dict[str, Any]:
     station = instance["station"]
-
     twin = {
         "twin_id": instance["line"]["line_name"],
         "type": "single_station_cell",
@@ -345,17 +344,14 @@ def compile_twin(instance: Dict[str, Any]) -> Dict[str, Any]:
                     "cycle_time_s": station["cycle_time_s"],
                     "availability_pct": station["availability_pct"],
                     "setup_time_s": station.get("setup_time_s", 0),
-                    "scrap_rate_pct": station.get("scrap_rate_pct", 0.0)
-                }
+                    "scrap_rate_pct": station.get("scrap_rate_pct", 0.0),
+                },
             },
-            {"id": "SNK", "kind": "sink"}
+            {"id": "SNK", "kind": "sink"},
         ],
-        "edges": [
-            {"from": "SRC", "to": station["id"]},
-            {"from": station["id"], "to": "SNK"}
-        ],
+        "edges": [{"from": "SRC", "to": station["id"]}, {"from": station["id"], "to": "SNK"}],
         "quality": instance.get("quality", {}),
-        "data": instance.get("data", {})
+        "data": instance.get("data", {}),
     }
     return twin
 
@@ -375,14 +371,8 @@ def compute_kpis(twin: Dict[str, Any]) -> Dict[str, Any]:
         "cycle_time_s": cycle,
         "availability": availability,
         "scrap_rate": scrap,
-        "bottleneck": station_node["id"]
+        "bottleneck": station_node["id"],
     }
-
-
-# ---- API (service) ----
-
-class InstancePayload(BaseModel):
-    instance: Dict[str, Any]
 
 
 @app.get("/status")
@@ -402,15 +392,12 @@ def compute_kpi(payload: InstancePayload):
     kpis = compute_kpis(twin)
     return {"twin_id": twin["twin_id"], "kpis": kpis, "twin": twin}
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "DTaaS", "docs": "/docs"}
 
-from fastapi.responses import HTMLResponse
-
+# ============================================================
+# 5) Simple UI (textarea JSON)
+# ============================================================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
-    # JSON di esempio pre-caricato nella textarea
     sample = r'''{
   "instance": {
     "line": {
@@ -436,7 +423,6 @@ def ui():
     }
   }
 }'''
-
     return f"""
 <!doctype html>
 <html>
@@ -505,13 +491,11 @@ def ui():
 </body>
 </html>
 """
-    
-from fastapi.responses import RedirectResponse
 
-@app.get("/")
-def root():
-    return RedirectResponse("/ui-builder")
-    
+
+# ============================================================
+# 6) Templates (static library) + Template-based UI (single-station)
+# ============================================================
 TEMPLATES = {
     "single_station_v1": {
         "template_id": "single_station_v1",
@@ -525,50 +509,52 @@ TEMPLATES = {
                     "type": "object",
                     "required": ["line_name", "shift_hours", "target_throughput_pph"],
                     "properties": {
-                        "line_name": { "type": "string", "minLength": 2, "title": "Line name" },
-                        "shift_hours": { "type": "number", "minimum": 0.5, "maximum": 24, "title": "Shift duration (hours)" },
-                        "target_throughput_pph": { "type": "number", "minimum": 1, "title": "Target throughput (pcs/hour)" }
-                    }
+                        "line_name": {"type": "string", "minLength": 2, "title": "Line name"},
+                        "shift_hours": {"type": "number", "minimum": 0.5, "maximum": 24, "title": "Shift duration (hours)"},
+                        "target_throughput_pph": {"type": "number", "minimum": 1, "title": "Target throughput (pcs/hour)"},
+                    },
                 },
                 "station": {
                     "type": "object",
                     "title": "Station",
                     "required": ["id", "type", "cycle_time_s", "availability_pct"],
                     "properties": {
-                        "id": { "type": "string", "default": "S1", "title": "Station ID" },
-                        "type": { "type": "string", "enum": ["assembly", "welding"], "title": "Station type" },
-                        "cycle_time_s": { "type": "number", "minimum": 1, "maximum": 600, "title": "Cycle time (s)" },
-                        "availability_pct": { "type": "number", "minimum": 50, "maximum": 99.9, "title": "Availability (%)" },
-                        "setup_time_s": { "type": "number", "minimum": 0, "maximum": 900, "default": 0, "title": "Setup/Changeover (s)" },
-                        "scrap_rate_pct": { "type": "number", "minimum": 0, "maximum": 20, "default": 0.5, "title": "Waste (%)" }
-                    }
+                        "id": {"type": "string", "default": "S1", "title": "Station ID"},
+                        "type": {"type": "string", "enum": ["assembly", "welding"], "title": "Station type"},
+                        "cycle_time_s": {"type": "number", "minimum": 1, "maximum": 600, "title": "Cycle time (s)"},
+                        "availability_pct": {"type": "number", "minimum": 50, "maximum": 99.9, "title": "Availability (%)"},
+                        "setup_time_s": {"type": "number", "minimum": 0, "maximum": 900, "default": 0, "title": "Setup/Changeover (s)"},
+                        "scrap_rate_pct": {"type": "number", "minimum": 0, "maximum": 20, "default": 0.5, "title": "Waste (%)"},
+                    },
                 },
                 "quality": {
                     "type": "object",
                     "required": ["inspection_enabled", "rework_enabled"],
                     "properties": {
-                        "inspection_enabled": { "type": "boolean", "default": True, "title": "Inspection enabled" },
-                        "rework_enabled": { "type": "boolean", "default": False, "title": "Rework active" },
-                        "rework_cycle_time_s": { "type": "number", "minimum": 1, "maximum": 900, "default": 60, "title": "Rework cycle time (s)" }
-                    }
+                        "inspection_enabled": {"type": "boolean", "default": True, "title": "Inspection enabled"},
+                        "rework_enabled": {"type": "boolean", "default": False, "title": "Rework active"},
+                        "rework_cycle_time_s": {"type": "number", "minimum": 1, "maximum": 900, "default": 60, "title": "Rework cycle time (s)"},
+                    },
                 },
                 "data": {
                     "type": "object",
                     "required": ["mode"],
                     "properties": {
-                        "mode": { "type": "string", "enum": ["simulation", "realtime"], "default": "simulation", "title": "Mode" },
-                        "opcua_endpoint": { "type": "string", "title": "OPC-UA endpoint (if realtime)" },
-                        "mqtt_topic_prefix": { "type": "string", "title": "MQTT topic prefix (if realtime)" }
-                    }
-                }
-            }
-        }
+                        "mode": {"type": "string", "enum": ["simulation", "realtime"], "default": "simulation", "title": "Mode"},
+                        "opcua_endpoint": {"type": "string", "title": "OPC-UA endpoint (if realtime)"},
+                        "mqtt_topic_prefix": {"type": "string", "title": "MQTT topic prefix (if realtime)"},
+                    },
+                },
+            },
+        },
     }
 }
+
 
 @app.get("/templates")
 def list_templates():
     return [{"template_id": t["template_id"], "name": t["name"]} for t in TEMPLATES.values()]
+
 
 @app.get("/templates/{template_id}/schema")
 def get_template_schema(template_id: str):
@@ -576,11 +562,9 @@ def get_template_schema(template_id: str):
         return {"error": "template not found"}
     return TEMPLATES[template_id]["schema"]
 
-from fastapi.responses import HTMLResponse
 
 @app.get("/ui-template", response_class=HTMLResponse)
 def ui_template():
-    # default template
     default_template = "single_station_v1"
 
     return f"""
@@ -659,148 +643,6 @@ def ui_template():
         editor = null;
       }}
 
-      JSONEditor.defaults.options.theme = 'html';
-      JSONEditor.defaults.options.iconlib = 'fontawesome5';
-
-      editor = new JSONEditor(document.getElementById('editor_holder'), {{
-        schema: schema,
-        disable_collapse: true,
-        disable_properties: true,
-        no_additional_properties: true,
-        required_by_default: true
-      }});
-
-      status.textContent = 'Template loaded';
-      document.getElementById('out').textContent = '—';
-    }}
-
-    async function compute() {{
-      const status = document.getElementById('status');
-      const out = document.getElementById('out');
-      out.textContent = '—';
-
-      if (!editor) {{
-        status.textContent = 'No editor';
-        return;
-      }}
-
-      const errors = editor.validate();
-      if (errors.length) {{
-        status.textContent = 'Fix validation errors';
-        out.textContent = JSON.stringify(errors, null, 2);
-        return;
-      }}
-
-      const instance = editor.getValue();
-      status.textContent = 'Running...';
-
-      try {{
-        const res = await fetch('/compute-kpi', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ instance }})
-        }});
-        const data = await res.json();
-        status.textContent = res.ok ? 'OK' : ('Error ' + res.status);
-        out.textContent = JSON.stringify(data, null, 2);
-      }} catch (e) {{
-        status.textContent = 'Request failed';
-        out.textContent = String(e);
-      }}
-    }}
-
-    initTemplates();
-  </script>
-</body>
-</html>
-"""
-
-from fastapi.responses import HTMLResponse
-
-@app.get("/ui-template", response_class=HTMLResponse)
-def ui_template():
-    # default template
-    default_template = "single_station_v1"
-
-    return f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>DTaaS – Template UI</title>
-  <style>
-    body {{ font-family: system-ui, Arial; max-width: 980px; margin: 40px auto; padding: 0 16px; }}
-    .row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
-    button {{ padding: 10px 14px; cursor: pointer; }}
-    pre {{ background:#f6f6f6; padding:12px; overflow:auto; }}
-    #editor_holder {{ margin-top: 16px; }}
-  </style>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@json-editor/json-editor@latest/dist/css/jsoneditor.min.css">
-</head>
-<body>
-  <h2>DTaaS – Template-based UI</h2>
-  <p>Qui l’utente compila un form generato dal template (JSON Schema). Nessun JSON manuale.</p>
-
-  <div class="row">
-    <label for="template">Template:</label>
-    <select id="template"></select>
-    <button onclick="loadTemplate()">Load</button>
-    <button onclick="compute()">Compute KPI</button>
-    <span id="status"></span>
-  </div>
-
-  <div id="editor_holder"></div>
-
-  <h3>Output</h3>
-  <pre id="out">—</pre>
-
-  <p style="margin-top:20px;">
-    API Docs: <a href="/docs">/docs</a>
-  </p>
-
-  <script src="https://cdn.jsdelivr.net/npm/@json-editor/json-editor@latest/dist/jsoneditor.min.js"></script>
-  <script>
-    let editor = null;
-
-    async function fetchJSON(url) {{
-      const res = await fetch(url);
-      return await res.json();
-    }}
-
-    async function initTemplates() {{
-      const templates = await fetchJSON('/templates');
-      const sel = document.getElementById('template');
-      sel.innerHTML = '';
-      templates.forEach(t => {{
-        const opt = document.createElement('option');
-        opt.value = t.template_id;
-        opt.textContent = t.template_id + ' — ' + t.name;
-        sel.appendChild(opt);
-      }});
-      sel.value = "{default_template}";
-      await loadTemplate();
-    }}
-
-    async function loadTemplate() {{
-      const status = document.getElementById('status');
-      status.textContent = 'Loading template...';
-      const templateId = document.getElementById('template').value;
-      const schema = await fetchJSON(`/templates/${{templateId}}/schema`);
-
-      if (schema.error) {{
-        status.textContent = 'Template not found';
-        return;
-      }}
-
-      if (editor) {{
-        editor.destroy();
-        editor = null;
-      }}
-
-      JSONEditor.defaults.options.theme = 'html';
-      JSONEditor.defaults.options.iconlib = 'fontawesome5';
-
       editor = new JSONEditor(document.getElementById('editor_holder'), {{
         schema: schema,
         disable_collapse: true,
@@ -855,9 +697,9 @@ def ui_template():
 """
 
 
-
-
-
-
-
-
+# ============================================================
+# 7) Root redirect (single source of truth)
+# ============================================================
+@app.get("/")
+def root():
+    return RedirectResponse("/ui-builder")
