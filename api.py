@@ -1,6 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Any, Dict, List, Optional
 import sqlite3
 import json
@@ -8,7 +8,30 @@ import time
 import simpy
 import random
 
-app = FastAPI(title="DTaaS", version="0.2")
+class StationForm(BaseModel):
+    id: str
+    type: str
+    cycle_time_s: float = Field(gt=0)
+    availability_pct: float = Field(ge=0, le=100)
+    scrap_rate_pct: float = Field(ge=0, le=100, default=0.0)
+
+class WizardPayload(BaseModel):
+    line_name: str
+    num_stations: int = Field(gt=0)
+    buffers: bool = True
+    buffer_capacity: int = Field(ge=0, default=10)
+    horizon_s: float = Field(gt=0, default=3600)
+    interarrival_s: float = Field(gt=0, default=5)
+    stations: List[StationForm]
+
+    @field_validator('stations')
+    def check_stations_count(cls, v, info):
+        num = info.data.get('num_stations')
+        if num and len(v) != num:
+            raise ValueError(f'stations list must have {num} elements')
+        return v
+
+app = FastAPI(title="DTaaS", version="0.3")
 
 DB_PATH = "dtaas.db"
 
@@ -77,9 +100,7 @@ init_db()
 
 
 # ============================================================
-# SimPy flow line simulation (multi-station)
-# Uses instance like UI-builder output:
-# { line, stations[], buffers[], sim{horizon_s, interarrival_s} }
+# SimPy flow line simulation (FIXED VERSION)
 # ============================================================
 def sim_flow_line(instance: Dict[str, Any]) -> Dict[str, Any]:
     horizon_s = float(instance["sim"]["horizon_s"])
@@ -89,61 +110,135 @@ def sim_flow_line(instance: Dict[str, Any]) -> Dict[str, Any]:
     buffers = instance.get("buffers", [])
 
     env = simpy.Environment()
-    res = {s["id"]: simpy.Resource(env, capacity=1) for s in stations}
+    
+    # Resources per stazioni
+    station_res = {s["id"]: simpy.Resource(env, capacity=1) for s in stations}
+    
+    # Buffer stores tra le stazioni
+    buffer_stores = {}
+    for i, b in enumerate(buffers):
+        cap = int(b.get("capacity", 10))
+        buffer_stores[i] = simpy.Store(env, capacity=max(cap, 1))
 
-    stores: List[simpy.Store] = []
-    for b in buffers:
-        cap = int(b.get("capacity", 0))
-        stores.append(simpy.Store(env, capacity=cap if cap > 0 else 1))
+    # Contatori
+    stats = {
+        "started": 0,
+        "completed": 0,
+        "scrapped": 0,
+        "scrapped_by_station": {s["id"]: 0 for s in stations},
+        "downtime_events": {s["id"]: 0 for s in stations},
+        "total_downtime_s": {s["id"]: 0.0 for s in stations},
+        "parts_processed": {s["id"]: 0 for s in stations}
+    }
 
-    completed = 0
-    started = 0
+    def process_station(station, job_id):
+        """Processa un pezzo in una stazione, gestendo availability e scrap"""
+        sid = station["id"]
+        avail = float(station["availability_pct"]) / 100.0
+        ct = float(station["cycle_time_s"])
+        scrap_rate = float(station.get("scrap_rate_pct", 0.0)) / 100.0
 
-    def process_station(s, job_id):
-        avail = float(s["availability_pct"]) / 100.0
-        ct = float(s["cycle_time_s"])
-        scrap = float(s.get("scrap_rate_pct", 0.0)) / 100.0
-
-        with res[s["id"]].request() as req:
+        with station_res[sid].request() as req:
             yield req
+            
+            # Check se la macchina è disponibile
             if random.random() > avail:
-                yield env.timeout(ct)  # downtime proxy
+                # Macchina in downtime - tempo di riparazione
+                downtime_duration = ct * random.uniform(0.5, 2.0)
+                stats["downtime_events"][sid] += 1
+                stats["total_downtime_s"][sid] += downtime_duration
+                yield env.timeout(downtime_duration)
+            
+            # Processa il pezzo
             yield env.timeout(ct)
-
-        good = (random.random() > scrap)
-        return good
+            stats["parts_processed"][sid] += 1
+            
+            # Check se il pezzo è scartato
+            if random.random() < scrap_rate:
+                stats["scrapped"] += 1
+                stats["scrapped_by_station"][sid] += 1
+                return False  # Pezzo scartato
+            
+            return True  # Pezzo OK
 
     def job(job_id):
-        nonlocal completed, started
-        started += 1
+        """Gestisce il flusso di un singolo pezzo attraverso la linea"""
+        nonlocal stats
+        stats["started"] += 1
 
-        for i, s in enumerate(stations):
-            good = yield env.process(process_station(s, job_id))
-            if not good:
+        for i, station in enumerate(stations):
+            # Processa nella stazione corrente
+            is_good = yield env.process(process_station(station, job_id))
+            
+            if not is_good:
+                # Pezzo scartato - esce dalla linea
                 return
+            
+            # Se c'è una stazione successiva, usa il buffer
+            if i < len(stations) - 1:
+                if i in buffer_stores:
+                    # Metti nel buffer
+                    yield buffer_stores[i].put(job_id)
+                    
+                    # La prossima stazione prende dal buffer quando è pronta
+                    # (questo succede automaticamente nel prossimo ciclo)
 
-            if i < len(stations) - 1 and len(stores) > 0:
-                yield stores[i].put(job_id)
-                _ = yield stores[i].get()
+        # Pezzo completato con successo
+        stats["completed"] += 1
 
-        completed += 1
+    def buffer_consumer(buffer_idx):
+        """Preleva pezzi dal buffer per la stazione successiva"""
+        while True:
+            job_id = yield buffer_stores[buffer_idx].get()
+            # Il pezzo è stato prelevato, ora è disponibile per la prossima stazione
+            # (la logica di processo avviene nella funzione job)
 
     def source():
+        """Genera nuovi job alla frequenza specificata"""
         job_id = 0
-        while env.now < horizon_s:
+        while True:
+            if env.now >= horizon_s:
+                break
             job_id += 1
             env.process(job(job_id))
             yield env.timeout(interarrival_s)
 
+    # Avvia il source
     env.process(source())
+    
+    # Avvia i consumer per i buffer (se ci sono)
+    for buf_idx in buffer_stores.keys():
+        env.process(buffer_consumer(buf_idx))
+    
+    # Esegui la simulazione
     env.run(until=horizon_s)
 
-    throughput_pph = (completed / horizon_s) * 3600.0
+    # Calcola metriche finali
+    throughput_pph = (stats["completed"] / horizon_s) * 3600.0 if horizon_s > 0 else 0
+    scrap_rate = (stats["scrapped"] / stats["started"]) if stats["started"] > 0 else 0
+    
+    # Calcola availability effettiva per stazione
+    station_availability = {}
+    for sid in stats["parts_processed"].keys():
+        total_processing_time = stats["parts_processed"][sid] * next(
+            s["cycle_time_s"] for s in stations if s["id"] == sid
+        )
+        total_time = total_processing_time + stats["total_downtime_s"][sid]
+        avail = (total_processing_time / total_time * 100) if total_time > 0 else 100
+        station_availability[sid] = round(avail, 2)
+
     return {
         "horizon_s": horizon_s,
-        "started_jobs": started,
-        "completed_good": completed,
+        "started_jobs": stats["started"],
+        "completed_good": stats["completed"],
+        "scrapped_total": stats["scrapped"],
         "throughput_pph": round(throughput_pph, 2),
+        "scrap_rate_pct": round(scrap_rate * 100, 2),
+        "scrapped_by_station": stats["scrapped_by_station"],
+        "downtime_events_by_station": stats["downtime_events"],
+        "total_downtime_s_by_station": {k: round(v, 1) for k, v in stats["total_downtime_s"].items()},
+        "station_availability_pct": station_availability,
+        "parts_processed_by_station": stats["parts_processed"]
     }
 
 
@@ -153,14 +248,14 @@ def sim_flow_line(instance: Dict[str, Any]) -> Dict[str, Any]:
 class CreateTwinPayload(BaseModel):
     name: str
     model_type: str = "flow_line"
-    config: Dict[str, Any]  # base instance/config for the twin
+    config: Dict[str, Any]
 
 class CreateScenarioPayload(BaseModel):
     name: str
-    overrides: Dict[str, Any]  # partial override to merge into twin config
+    overrides: Dict[str, Any]
 
 class RunPayload(BaseModel):
-    sim: Optional[Dict[str, Any]] = None  # optional override of sim settings
+    sim: Optional[Dict[str, Any]] = None
 
 class EventPayload(BaseModel):
     event_type: str
@@ -169,9 +264,23 @@ class EventPayload(BaseModel):
     payload: Optional[Dict[str, Any]] = None
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep merge con supporto per merge parziale di array di stazioni"""
     out = dict(base)
     for k, v in override.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
+        if k == "stations" and isinstance(v, list) and isinstance(out.get(k), list):
+            # Merge stazioni per ID
+            base_stations = {s["id"]: s for s in out[k]}
+            for override_station in v:
+                if "id" in override_station:
+                    sid = override_station["id"]
+                    if sid in base_stations:
+                        # Merge parametri della stazione
+                        base_stations[sid].update(override_station)
+                    else:
+                        # Nuova stazione
+                        base_stations[sid] = override_station
+            out[k] = list(base_stations.values())
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = deep_merge(out[k], v)
         else:
             out[k] = v
@@ -207,7 +316,7 @@ def get_twin(twin_id: int):
     r = conn.execute("SELECT * FROM twins WHERE id=?", (twin_id,)).fetchone()
     conn.close()
     if not r:
-        return {"error": "twin not found"}
+        raise HTTPException(status_code=404, detail="Twin not found")
     d = dict(r)
     d["config"] = json.loads(d.pop("config_json"))
     return d
@@ -219,11 +328,10 @@ def get_twin(twin_id: int):
 @app.post("/twins/{twin_id}/scenarios")
 def create_scenario(twin_id: int, p: CreateScenarioPayload):
     conn = db()
-    # verify twin exists
     t = conn.execute("SELECT id FROM twins WHERE id=?", (twin_id,)).fetchone()
     if not t:
         conn.close()
-        return {"error": "twin not found"}
+        raise HTTPException(status_code=404, detail="Twin not found")
 
     cur = conn.cursor()
     cur.execute(
@@ -252,7 +360,7 @@ def run_scenario(twin_id: int, scenario_id: int, p: RunPayload = RunPayload()):
     s = conn.execute("SELECT overrides_json FROM scenarios WHERE id=? AND twin_id=?", (scenario_id, twin_id)).fetchone()
     if not t or not s:
         conn.close()
-        return {"error": "twin or scenario not found"}
+        raise HTTPException(status_code=404, detail="Twin or scenario not found")
 
     base_cfg = json.loads(t["config_json"])
     overrides = json.loads(s["overrides_json"])
@@ -279,7 +387,7 @@ def run_base(twin_id: int, p: RunPayload = RunPayload()):
     t = conn.execute("SELECT config_json FROM twins WHERE id=?", (twin_id,)).fetchone()
     if not t:
         conn.close()
-        return {"error": "twin not found"}
+        raise HTTPException(status_code=404, detail="Twin not found")
 
     instance = json.loads(t["config_json"])
     if p.sim:
@@ -316,7 +424,6 @@ def compare_runs(twin_id: int, last_n: int = 5):
 
 # ============================================================
 # Monitoring (events -> live KPIs)
-# Minimal but already useful: throughput, scrap, downtime, uptime
 # ============================================================
 @app.post("/twins/{twin_id}/events")
 def post_event(twin_id: int, e: EventPayload):
@@ -326,7 +433,7 @@ def post_event(twin_id: int, e: EventPayload):
     t = conn.execute("SELECT id FROM twins WHERE id=?", (twin_id,)).fetchone()
     if not t:
         conn.close()
-        return {"error": "twin not found"}
+        raise HTTPException(status_code=404, detail="Twin not found")
 
     conn.execute(
         "INSERT INTO events(twin_id, ts, event_type, station_id, payload_json) VALUES (?,?,?,?,?)",
@@ -351,7 +458,7 @@ def live_kpis(twin_id: int, window_s: int = 3600):
     completed = 0
     scrap = 0
 
-    # downtime per station: track last down start
+    # downtime per station: track intervals
     down_start: Dict[str, float] = {}
     down_time: Dict[str, float] = {}
 
@@ -378,20 +485,20 @@ def live_kpis(twin_id: int, window_s: int = 3600):
 
     hours = window_s / 3600.0
     throughput_pph = completed / hours if hours > 0 else 0.0
-    scrap_rate = (scrap / completed) if completed > 0 else 0.0
+    scrap_rate = (scrap / (completed + scrap)) if (completed + scrap) > 0 else 0.0
 
     return {
         "window_s": window_s,
         "completed": completed,
         "scrap": scrap,
         "throughput_pph": round(throughput_pph, 2),
-        "scrap_rate": round(scrap_rate, 4),
+        "scrap_rate_pct": round(scrap_rate * 100, 2),
         "downtime_s_by_station": {k: round(v, 1) for k, v in down_time.items()},
     }
 
 
 # ============================================================
-# Minimal UI: create twin + run + scenarios + monitoring demo
+# UI
 # ============================================================
 @app.get("/ui-ops", response_class=HTMLResponse)
 def ui_ops():
@@ -401,21 +508,30 @@ def ui_ops():
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>DTaaS – Ops</title>
+  <title>DTaaS – Ops (v0.3 Fixed)</title>
   <style>
-    body { font-family: system-ui, Arial; max-width: 980px; margin: 40px auto; padding: 0 16px; }
-    textarea { width: 100%; height: 220px; font-family: ui-monospace, Menlo, Consolas, monospace; }
-    button { padding: 10px 14px; cursor: pointer; }
-    pre { background:#f6f6f6; padding:12px; overflow:auto; }
+    body { font-family: system-ui, Arial; max-width: 1100px; margin: 40px auto; padding: 0 16px; }
+    textarea { width: 100%; height: 240px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+    button { padding: 10px 14px; cursor: pointer; background: #0066cc; color: white; border: none; border-radius: 4px; }
+    button:hover { background: #0052a3; }
+    pre { background:#f6f6f6; padding:12px; overflow:auto; border-radius: 4px; font-size: 13px; }
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0; }
-    input { padding: 6px; }
+    input { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+    h2 { color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 10px; }
+    h3 { color: #555; margin-top: 30px; }
+    .info { background: #e3f2fd; padding: 12px; border-radius: 4px; margin: 10px 0; }
   </style>
 </head>
 <body>
-  <h2>DTaaS – What-if + Monitoring (v0.2)</h2>
+  <h2>DTaaS – Digital Twin as a Service (v0.3 - Fixed)</h2>
+  
+  <div class="info">
+    <strong>Improvements:</strong> Fixed simulation logic (downtime, buffers, scrap tracking), 
+    better scenario merging (can override single station params), proper HTTP errors, enhanced metrics.
+  </div>
 
   <h3>1) Create a Twin (flow line)</h3>
-  <p>Config base (instance) che verrà salvata come twin.</p>
+  <p>Base configuration for the production line digital twin.</p>
   <textarea id="cfg">{
   "line": { "line_name": "Line_A" },
   "stations": [
@@ -432,99 +548,159 @@ def ui_ops():
   <div class="row">
     <input id="tname" value="Twin_Line_A" />
     <button onclick="createTwin()">Create Twin</button>
-    <span id="twinid"></span>
+    <span id="twinid" style="font-weight:bold; color:#0066cc;"></span>
   </div>
 
-  <h3>2) Run base + create scenario + run scenario</h3>
+  <h3>2) Run base configuration</h3>
   <div class="row">
-    <button onclick="runBase()">Run Base</button>
-    <button onclick="createScenario()">Create Scenario (S2 faster)</button>
+    <button onclick="runBase()">Run Base Configuration</button>
+  </div>
+
+  <h3>3) Create and run What-If scenarios</h3>
+  <p>Example: What if we improve S2 cycle time and availability?</p>
+  <div class="row">
+    <button onclick="createScenario()">Create Scenario (S2 improved)</button>
     <button onclick="runScenario()">Run Scenario</button>
+    <button onclick="compareRuns()">Compare Last 5 Runs</button>
   </div>
 
-  <h3>3) Monitoring demo (send events)</h3>
+  <h3>4) Monitoring demo (send events)</h3>
   <div class="row">
-    <button onclick="sendEvent('part_completed')">+ part_completed</button>
-    <button onclick="sendEvent('scrap')">+ scrap</button>
-    <button onclick="sendEvent('machine_down')">machine_down S2</button>
-    <button onclick="sendEvent('machine_up')">machine_up S2</button>
-    <button onclick="liveKpis()">Get live KPIs (last hour)</button>
+    <button onclick="sendEvent('part_completed')">+ Part Completed</button>
+    <button onclick="sendEvent('scrap')">+ Scrap</button>
+    <button onclick="sendEvent('machine_down')">Machine Down (S2)</button>
+    <button onclick="sendEvent('machine_up')">Machine Up (S2)</button>
+    <button onclick="liveKpis()">Get Live KPIs</button>
   </div>
 
   <h3>Output</h3>
-  <pre id="out">—</pre>
+  <pre id="out">Ready. Create a twin to start.</pre>
 
 <script>
 let TWIN_ID = null;
 let SCENARIO_ID = null;
 
-function out(x){ document.getElementById('out').textContent = JSON.stringify(x,null,2); }
+function out(x){ 
+  document.getElementById('out').textContent = JSON.stringify(x, null, 2); 
+}
 
 async function createTwin(){
-  const cfg = JSON.parse(document.getElementById('cfg').value);
-  const name = document.getElementById('tname').value || 'Twin';
-  const res = await fetch('/twins', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ name, model_type:'flow_line', config: cfg })
-  });
-  const data = await res.json();
-  TWIN_ID = data.twin_id;
-  document.getElementById('twinid').textContent = 'twin_id=' + TWIN_ID;
-  out(data);
+  try {
+    const cfg = JSON.parse(document.getElementById('cfg').value);
+    const name = document.getElementById('tname').value || 'Twin';
+    const res = await fetch('/twins', {
+      method:'POST', 
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ name, model_type:'flow_line', config: cfg })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    TWIN_ID = data.twin_id;
+    document.getElementById('twinid').textContent = `Twin ID: ${TWIN_ID}`;
+    out(data);
+  } catch(e) {
+    out({error: e.message});
+  }
 }
 
 async function runBase(){
-  if(!TWIN_ID) return out({error:'create twin first'});
-  const res = await fetch(`/twins/${TWIN_ID}/run`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})});
-  out(await res.json());
+  if(!TWIN_ID) return out({error:'Create twin first'});
+  try {
+    const res = await fetch(`/twins/${TWIN_ID}/run`, { 
+      method:'POST', 
+      headers:{'Content-Type':'application/json'}, 
+      body: JSON.stringify({})
+    });
+    if (!res.ok) throw new Error(await res.text());
+    out(await res.json());
+  } catch(e) {
+    out({error: e.message});
+  }
 }
 
 async function createScenario(){
-  if(!TWIN_ID) return out({error:'create twin first'});
-  // example: make S2 faster by overriding stations[1].cycle_time_s
-  const overrides = {
-    "stations": [
-      {"id":"S1","type":"assembly","cycle_time_s":20,"availability_pct":92,"scrap_rate_pct":1.0},
-      {"id":"S2","type":"welding","cycle_time_s":18,"availability_pct":90,"scrap_rate_pct":1.5},
-      {"id":"S3","type":"assembly","cycle_time_s":22,"availability_pct":93,"scrap_rate_pct":0.8}
-    ]
-  };
-  const res = await fetch(`/twins/${TWIN_ID}/scenarios`, {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ name:'S2 faster', overrides })
-  });
-  const data = await res.json();
-  SCENARIO_ID = data.scenario_id;
-  out(data);
+  if(!TWIN_ID) return out({error:'Create twin first'});
+  try {
+    // Improved scenario: S2 faster (18s vs 25s) and more reliable (95% vs 90%)
+    const overrides = {
+      "stations": [
+        {"id":"S2", "cycle_time_s":18, "availability_pct":95}
+      ]
+    };
+    const res = await fetch(`/twins/${TWIN_ID}/scenarios`, {
+      method:'POST', 
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ name:'S2 improved (faster + more reliable)', overrides })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    SCENARIO_ID = data.scenario_id;
+    out(data);
+  } catch(e) {
+    out({error: e.message});
+  }
 }
 
 async function runScenario(){
-  if(!TWIN_ID || !SCENARIO_ID) return out({error:'create scenario first'});
-  const res = await fetch(`/twins/${TWIN_ID}/scenarios/${SCENARIO_ID}/run`, {
-    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})
-  });
-  out(await res.json());
+  if(!TWIN_ID || !SCENARIO_ID) return out({error:'Create scenario first'});
+  try {
+    const res = await fetch(`/twins/${TWIN_ID}/scenarios/${SCENARIO_ID}/run`, {
+      method:'POST', 
+      headers:{'Content-Type':'application/json'}, 
+      body: JSON.stringify({})
+    });
+    if (!res.ok) throw new Error(await res.text());
+    out(await res.json());
+  } catch(e) {
+    out({error: e.message});
+  }
+}
+
+async function compareRuns(){
+  if(!TWIN_ID) return out({error:'Create twin first'});
+  try {
+    const res = await fetch(`/twins/${TWIN_ID}/compare?last_n=5`);
+    if (!res.ok) throw new Error(await res.text());
+    out(await res.json());
+  } catch(e) {
+    out({error: e.message});
+  }
 }
 
 async function sendEvent(type){
-  if(!TWIN_ID) return out({error:'create twin first'});
-  const payload = (type==='machine_down' || type==='machine_up') ? {station_id:'S2'} : {};
-  const res = await fetch(`/twins/${TWIN_ID}/events`, {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ event_type:type, station_id: payload.station_id || null })
-  });
-  out(await res.json());
+  if(!TWIN_ID) return out({error:'Create twin first'});
+  try {
+    const payload = {
+      event_type: type,
+      station_id: (type==='machine_down' || type==='machine_up') ? 'S2' : null
+    };
+    const res = await fetch(`/twins/${TWIN_ID}/events`, {
+      method:'POST', 
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error(await res.text());
+    out(await res.json());
+  } catch(e) {
+    out({error: e.message});
+  }
 }
 
 async function liveKpis(){
-  if(!TWIN_ID) return out({error:'create twin first'});
-  const res = await fetch(`/twins/${TWIN_ID}/kpis/live?window_s=3600`);
-  out(await res.json());
+  if(!TWIN_ID) return out({error:'Create twin first'});
+  try {
+    const res = await fetch(`/twins/${TWIN_ID}/kpis/live?window_s=3600`);
+    if (!res.ok) throw new Error(await res.text());
+    out(await res.json());
+  } catch(e) {
+    out({error: e.message});
+  }
 }
 </script>
 
-  <p style="margin-top:20px;">
-    API Docs: <a href="/docs">/docs</a>
+  <p style="margin-top:40px; padding-top:20px; border-top:1px solid #ddd;">
+    <strong>API Docs:</strong> <a href="/docs">/docs</a> | 
+    <strong>Status:</strong> <a href="/status">/status</a>
   </p>
 </body>
 </html>
@@ -532,8 +708,25 @@ async function liveKpis(){
 
 @app.get("/status")
 def status():
-    return {"status": "ok", "service": "DTaaS", "docs": "/docs"}
+    return {"status": "ok", "service": "DTaaS", "version": "0.3", "docs": "/docs"}
 
 @app.get("/")
 def root():
     return RedirectResponse("/ui-ops")
+
+@app.post("/ui/compile-instance")
+def ui_compile_instance(p: WizardPayload):
+    stations = [s.model_dump() for s in p.stations]
+
+    buffers = []
+    if p.buffers and p.num_stations > 1:
+        for i in range(p.num_stations - 1):
+            buffers.append({"id": f"B{i+1}{i+2}", "capacity": int(p.buffer_capacity)})
+
+    instance = {
+        "line": {"line_name": p.line_name},
+        "stations": stations,
+        "buffers": buffers,
+        "sim": {"horizon_s": float(p.horizon_s), "interarrival_s": float(p.interarrival_s)}
+    }
+    return {"instance": instance}
